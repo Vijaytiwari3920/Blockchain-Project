@@ -53,24 +53,59 @@ A `Block` consists of:
 
 ## 4. Consensus Engine
 
-### 4.1 Validator Scheduling (VRF Simulation)
-- The chain operates in fixed time **Slots**.
-- A deterministic pseudo-random schedule is generated. A `SEED` is repeatedly hashed with Keccak256 to simulate a Verifiable Random Function (VRF).
-- For every slot, a Primary Proposer and a Backup Proposer are selected via modulo math over the Validator pool.
+The Consensus Engine operates as a deterministic state machine driven by time-based **Slots**. It ensures that all validators agree on the sequence of blocks, valid transactions, and the global state root.
 
-### 4.2 Block Proposal & Aggregation
-1. **Primary Turn**: The scheduled primary gathers transactions from its Mempool, verifies nonces and balances, computes the hypothetical new `stateRoot`, and broadcasts a `BLOCK_PROPOSED` message.
-2. **Backup Turn**: If the primary is offline and misses the time window, the backup proposer steps in and proposes a recovery block.
-3. **Voting**: Other validators receive the proposal, independently validate the transactions and `stateRoot`, and reply with a `PARTIAL_SIGNATURE`.
-4. **Aggregation**: Once a node collects enough partial signatures to meet the predefined `THRESHOLD` (e.g., 3 out of 4 nodes), it aggregates them using BLS math and permanently adds the block to the chain.
+### 4.1 Validator Scheduling & VRF
+- **Slot Time**: The network progresses in discrete time segments called "Slots". In the current implementation, a slot consists of a `PROPOSAL_WINDOW` (5000ms) and a `PROPAGATION_WINDOW` (3000ms).
+- **VRF Sortition**: To decide which validator has the right to propose a block in a given slot, a Verifiable Random Function (VRF) is simulated. A global `SEED` ("genesis_seed") is hashed iteratively using `keccak256`. 
+  - For Slot `N`, the `SEED` is hashed `N` times.
+  - The first 8 bytes of the resulting hash are converted to an integer.
+  - Modulo arithmetic (`integer % TOTAL_VALIDATORS`) selects the index of the **Primary Proposer**.
+  - A secondary index (`(index + 1) % TOTAL_VALIDATORS`) selects the **Backup Proposer**.
 
-### 4.3 Transaction Fees & Incentives
-- When a block is successfully finalized, the block's proposer receives the sum of all `fee` fields from the transactions included in that block. 
-- The fees are deducted from the senders' balances during state execution.
+### 4.2 Exact Lifecycle of a Slot
 
-### 4.4 Finality
-- The chain uses a `K_CONFIRMATIONS` rule.
-- A block is considered highly probable, but true **Finality** is declared only when `K` (e.g., 5) subsequent valid blocks have been chained on top of it.
+When a new slot begins (`startNextSlot()`), validators check their public keys against the schedule:
+
+**Phase 1: Primary Proposal (0ms - 5000ms)**
+1. **Mempool Processing**: If a node determines it is the **Primary Proposer**, it instantly pulls all valid pending transactions from its `Mempool`.
+2. **State Simulation**: The node clones the global `StateManager`. It iterates through the transactions, deducts `amount + fee` from senders, increments senders' `nonces`, adds `amount` to recipients, and adds `fee`s to its own balance.
+3. **Block Creation**: The node calculates the new `stateRoot` from this simulated MPT, creates a new `Block` object containing the transactions and the `stateRoot`, signs the block hash with its BLS private key, and broadcasts a `BLOCK_PROPOSED` message to the P2P network.
+
+**Phase 2: Backup Recovery (5000ms - 8000ms)**
+- If the Primary is offline or partitioned, the other nodes will wait precisely `PROPOSAL_WINDOW_MS` (5 seconds). 
+- Upon timeout, a `[TIMEOUT] Primary missed slot!` event triggers. 
+- The designated **Backup Proposer** then executes the exact same steps (Mempool Processing -> State Simulation -> Block Creation), flagging the block as `isBackup = true`, and broadcasts it.
+
+**Phase 3: Slot Failure (> 8000ms)**
+- If another timeout of `PROPAGATION_WINDOW_MS` (3 seconds) expires without a backup block being finalized, the slot is considered entirely dead. 
+- A "Skipped Slot" dummy block is appended locally to advance the chain height, and the network moves to the next slot to prevent stalling.
+
+### 4.3 Validation & Voting Process
+When any validator receives a `BLOCK_PROPOSED` message, they run `validateProposal(block)`:
+1. **Sanity Checks**: Verify block height aligns with their local chain length and the proposer matches the VRF schedule.
+2. **Transaction Replay**: The receiving node clones its own local `StateManager` and replays every transaction in the block.
+   - It strictly rejects the block if any sender's `nonce` does not perfectly match the MPT.
+   - It strictly rejects the block if any sender's balance is `< amount + fee`.
+3. **State Root Verification**: After replaying, the node calculates its own local `stateRoot`. If it does not perfectly match the `stateRoot` proposed in the block, the block is maliciously altered and rejected.
+4. **Voting**: If valid, the node signs the block hash with its BLS private key and broadcasts a `PARTIAL_SIGNATURE` message.
+
+### 4.4 BLS Signature Aggregation & Commit
+- Validators accumulate incoming `PARTIAL_SIGNATURE` messages in the `pendingBlock`'s signature map.
+- During every network loop, `tryAggregateAndCommit()` is executed.
+- It counts the number of collected signatures. If `signatures >= THRESHOLD` (e.g., 3 out of 4 nodes):
+  1. **Aggregation**: The `@noble/bls12-381` library mathematically adds the individual BLS signatures together to create a single, compact `aggregatedSignature`.
+  2. **Commit**: The block is appended to the local `chain` array.
+  3. **State Application**: The transactions are permanently applied to the global `StateManager`.
+  4. **Next Slot**: The node immediately terminates the current slot timers and advances to the next slot early.
+
+### 4.5 Transaction Fees
+- Transaction fees are not arbitrarily minted; they are transferred directly from the sender to the node that successfully proposed the block. This logic is embedded directly into the State Simulation and Replay validation steps described above.
+
+### 4.6 Probabilistic Finality
+- The blockchain implements a `K_CONFIRMATIONS` constant (e.g., `K=5`).
+- While a block is structurally sound once it has threshold signatures, true network **Finality** is declared via the `_updateFinality()` hook.
+- A block at `Height X` is only marked as `FINAL` when the chain reaches `Height X + 5`. This ensures that even in the event of extreme network partitions, the finalized block cannot be reorganized out of the canonical chain.
 
 ## 5. Network Architecture (P2P)
 
