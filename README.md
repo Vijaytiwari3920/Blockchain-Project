@@ -1,4 +1,4 @@
-# Custom Blockchain: Technical Specifications
+#  Fork-Free High-Throughput PoS Consensus 
 
 This document outlines the bit-by-bit technical details of the custom Proof-of-Stake (PoS) blockchain developed in this repository. The system transitions from an initial Python simulation to a fully functional JavaScript Peer-to-Peer (P2P) network using an Account-based ledger model inspired by Ethereum.
 
